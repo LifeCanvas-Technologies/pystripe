@@ -883,7 +883,8 @@ def interpolate(image_path, input_path, output_path):
     o_dir = os.path.dirname(output_path.joinpath(rel_path))
     # print('other files in output directory:')
     # print(os.listdir(o_dir))
-    image_num = int(os.path.splitext(os.path.split(image_path)[1])[0])
+    str_image_num = os.path.splitext(os.path.split(image_path)[1])[0]
+    image_num = int(str_image_num)
     closest_image = {
         'name': os.listdir(o_dir)[0],
         'distance': abs(int(os.path.splitext(os.listdir(o_dir)[0])[0]) - image_num)
@@ -900,7 +901,7 @@ def interpolate(image_path, input_path, output_path):
             closest_image['distance'] = abs(test_num - image_num)
             # print('closest_image:')
             # print(closest_image)
-    new_file_name = str(image_num) + os.path.splitext(closest_image['name'])[1]
+    new_file_name = str_image_num + os.path.splitext(closest_image['name'])[1]
     try:
         shutil.copyfile(os.path.join(o_dir, closest_image['name']), os.path.join(o_dir, new_file_name))
     except Exception as e:
@@ -921,8 +922,8 @@ def main():
     if args.zstep is not None:
         zstep = int(args.zstep * 10)
 
-    if args.output_format not in ['.png', '.tif', '.tiff']:
-        raise ValueError("Custom output format not supported.")
+    # if args.output_format not in ['.png', '.tif', '.tiff']:
+    #     raise ValueError("Custom output format not supported.")
 
     if args.dark < 0:
         raise ValueError('Only positive values for dark offset are allowed')
