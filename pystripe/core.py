@@ -217,7 +217,7 @@ def waverec(coeffs, wavelet):
     """
     return pywt.waverec2(coeffs, wavelet, mode='symmetric', axes=(-2, -1))
 
-def waverec_troch(coeffs, wavelet):
+def waverec_torch(coeffs, wavelet):
     ptwt.waverec2(coeffs, wavelet, mode='symmetric', axes=(-2, -1))
 
 def fft(data, axis=-1, shift=True):
@@ -254,6 +254,9 @@ def ftt_torch(data, axis=-1, shift=True):
 def ifft(fdata, axis=-1):
     # fdata = fftpack.irfft(fdata, axis=0)
     return fftpack.irfft(fdata, axis=axis)
+
+def ifft_torch(fdata, *, n, axis=-1, ):
+    return torch.fft.irfft(fdata, dim=axis, n=n)
 
 
 def fft2(data, shift=True):
@@ -838,6 +841,13 @@ def _find_all_images(search_path, input_path, output_path, zstep=None):
 
     return img_paths
 
+def set_gpu_batch_size(img_dims=(2048, 2048)):
+    gpu_mem_for_use, total_gpu_memory = torch.cuda.mem_get_info()
+
+    rtx4090_mem = 24125636608
+    empirical_limit = 
+
+
 
 def batch_filter(input_path, output_path, workers, chunks, sigma, auto_mode, 
                  gpu_acceleration=False, gpu_chunks=int, level=0, wavelet='db3', crossover=10,
@@ -1106,7 +1116,8 @@ def filter_subbands_gpu(imgs_torch, use_sigma, filter_args):
         g = gaussian_filter(shape=fch.shape[-2:], sigma=s)
         g = torch.from_numpy(np.float32(g)).cuda()
         fch_filt = fch * g
-        ch_filt = ifft_torch(fch_filt)
+        dim_n = ch.shape[-1]
+        ch_filt = ifft_torch(fch_filt, n=dim_n)
         coeffs_filt.append((ch_filt, cv, cd))
 
     imgs_log_filtered = waverec_torch(coeffs_filt, filter_args['wavelet'])
