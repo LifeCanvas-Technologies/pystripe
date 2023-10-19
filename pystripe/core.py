@@ -440,7 +440,7 @@ def apply_flat_torch(imgs_torch, flat):
         flat = torch.from_numpy(flat.astype(np.float32))
 
     if imgs_torch.get_device() == flat.get_device():
-        flat.to(device=imgs_torch.get_device())
+        flat = flat.to(device=imgs_torch.get_device())
 
     return (imgs_torch / flat)
         
@@ -793,7 +793,7 @@ def batch_to_torch16(args_batch, num_ioworkers, img_dims):
 def offsign16_to_32(int16_tensor):
     shift = int(2**15)
     t = int16_tensor + shift
-    t.to(dtype=torch.float32)
+    t = t.to(dtype=torch.float32)
     return t + shift
 
 def _find_all_images(search_path, input_path, output_path, zstep=None):
@@ -844,8 +844,15 @@ def _find_all_images(search_path, input_path, output_path, zstep=None):
 def set_gpu_batch_size(img_dims=(2048, 2048)):
     gpu_mem_for_use, total_gpu_memory = torch.cuda.mem_get_info()
 
-    rtx4090_mem = 24125636608
-    empirical_limit = 
+    approx_rtx4090_mem = 24125636608 # gpu_mem_for_use from RTX 4090 
+    trial_maxdim = 2048
+    trial_nimgs = 64
+    trial_x = trial_nimgs * (trial_maxdim**2)  # 64 2048x2048 imgs
+    #  2048^2 * 64 * k <= 24 Gigs
+    k = approx_rtx4090_mem / trial_x
+
+    batch_size = np.floor(gpu_mem_for_use/(k * max(img_dims)**2))
+    return batch_size
 
 
 
@@ -1114,7 +1121,7 @@ def filter_subbands_gpu(imgs_torch, use_sigma, filter_args):
         s = ch.shape[-2] * width_frac
         fch = ftt_torch(ch, shift=False)
         g = gaussian_filter(shape=fch.shape[-2:], sigma=s)
-        g = torch.from_numpy(np.float32(g)).cuda()
+        g = torch.from_numpy(np.float32(g)).to(device='cuda')
         fch_filt = fch * g
         dim_n = ch.shape[-1]
         ch_filt = ifft_torch(fch_filt, n=dim_n)
