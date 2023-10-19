@@ -10,12 +10,16 @@ import imageio as iio
 import pywt
 import multiprocessing
 import tqdm
+import random
 from dcimg import DCIMGFile
 from pystripe import raw
 from .lightsheet_correct import correct_lightsheet
 import warnings
 import shutil
 from typing import Optional
+import torch, torchvision
+import ptwt
+import more_itertools as mit
 warnings.filterwarnings("ignore")
 
 supported_extensions = ['.tif', '.tiff', '.raw', '.dcimg', '.png']
@@ -192,6 +196,8 @@ def wavedec(img, wavelet, level=None):
     """
     return pywt.wavedec2(img, wavelet, mode='symmetric', level=level, axes=(-2, -1))
 
+def wavedec_torch(imgs_torch, wavelet, level=None):
+    return ptwt.wavedec2(imgs_torch, wavelet, mode='symetric', level=level, axes=(-2, -1))
 
 def waverec(coeffs, wavelet):
     """Reconstruct an image using a multilevel 2D inverse discrete wavelet transform
@@ -211,6 +217,8 @@ def waverec(coeffs, wavelet):
     """
     return pywt.waverec2(coeffs, wavelet, mode='symmetric', axes=(-2, -1))
 
+def waverec_troch(coeffs, wavelet):
+    ptwt.waverec2(coeffs, wavelet, mode='symmetric', axes=(-2, -1))
 
 def fft(data, axis=-1, shift=True):
     """Computes the 1D Fast Fourier Transform of an input array
@@ -236,6 +244,12 @@ def fft(data, axis=-1, shift=True):
         fdata = fftpack.fftshift(fdata)
     return fdata
 
+def ftt_torch(data, axis=-1, shift=True):
+    fdata = torch.fft.rfft(data, axis=axis)
+    # fdata = fftpack.rfft(fdata, axis=0)
+    if shift:
+        fdata = fftpack.fftshift(fdata)
+    return fdata
 
 def ifft(fdata, axis=-1):
     # fdata = fftpack.irfft(fdata, axis=0)
@@ -369,6 +383,8 @@ def max_level(min_len, wavelet):
 def sigmoid(x):
     return 1 / (1 + np.exp(-x))
 
+def sigmoid_torch(x):
+    return 1 / (1 + torch.exp(-x))
 # def sigmoid(x):
 #     if x >= 0:
 #         z = np.exp(-x)
@@ -383,6 +399,11 @@ def foreground_fraction(img, center, crossover, smoothing):
     f = sigmoid(z)
     return ndimage.gaussian_filter(f, sigma=smoothing)
 
+def foreground_fraction_torch(imgs_torch, center, crossover, smoothing):
+    z = (imgs_torch - center)/crossover
+    f = sigmoid_torch(z)
+    ks = (8, 8)  # kernal size, set to ~ NDimage defaullt
+    return torchvision.transforms.functional.gaussian_blur(f, ks, smoothing)
 
 def filter_subband(img, sigma, level, wavelet):
     img_log = np.log(1 + img)
@@ -410,6 +431,16 @@ def filter_subband(img, sigma, level, wavelet):
 
 def apply_flat(img, flat):
     return (img / flat).astype(img.dtype)
+
+def apply_flat_torch(imgs_torch, flat):
+    if flat.is_tensor() is False:
+        flat = torch.from_numpy(flat.astype(np.float32))
+
+    if imgs_torch.get_device() == flat.get_device():
+        flat.to(device=imgs_torch.get_device())
+
+    return (imgs_torch / flat)
+        
 
 
 def filter_streaks(img, sigma, level=0, wavelet='db3', crossover=10, threshold=-1, flat=None, dark=0):
@@ -651,6 +682,116 @@ def _read_filter_save(input_dict):
     # read_filter_save(input_path, output_path, sigma, level, wavelet, crossover, threshold, compression, flat)
     read_filter_save(**input_dict)
 
+def num_ioworkers():
+    if os.cpu_count <= 16:
+        return 8
+    elif os.cpu_count <= 32:
+        return 12
+    elif os.cpu_count <= 64:
+        return 16
+    else:
+        return int(0.25 * os.cpu_count)
+
+def batch_to_torch16(args_batch, num_ioworkers, img_dims):
+        
+    if (all(_get_extension(args['input_path']) in ('.tiff', '.tif') for args in args_batch) and len(args_batch) > 1):
+        assert(len(set(args['rotation'] for args in args_batch)) == 1), "Batch loading can only be done on inputs with the same `rotation`"
+        num_attempts = min(3, len(args_batch))
+        # dummy_idxs = random.sample(range(len(args_batch)), attempts)
+        file_batch = [str(args['input_path']) for args in args_batch]
+        if ioworkers is None or ioworkers < 1:
+            ioworkers = num_ioworkers()
+
+        #for dummy_idx in dummy_idxs:
+        for _ in range(num_attempts):
+            try:
+                # if img_dims is None:
+                #     dummy = args_batch[dummy_idx]
+                #     img_dims_using = imread(str(dummy['input_path'])).shape
+                # else:
+                #     img_dims_using = img_dims
+
+                batch_ndarry = tifffile.imread(files=file_batch, ioworkers=ioworkers)        
+                                    #chunkshape=img_dims_using,
+                                    #dtype=np.int16,
+                                    #out_inplace=False,
+                                    #ioworkers=ioworkers)
+                
+                if args_batch[0]['rotation']:
+                    batch_ndarry = np.rot90(batch_ndarry)
+                
+                batch_ndarry.dtype = np.int16
+                return torch.from_numpy(batch_ndarry)
+            except:
+                continue
+        else:
+            print('A tiff batch failed to load. Resorting to single-threaded reading')
+
+    def _single_read(args): # For non-Tiffs or in the event of a corrupted image.
+        n = 3
+        input_path = args['input_path']
+        z_idx = args['z_idx']
+        for i in range(n):
+            try:
+                if z_idx is not None: # Presuming path is a DCIMG file!!
+                    assert str(input_path).endswith('.dcimg')
+                    img = imread_dcimg(str(input_path), z_idx)
+                    if args['rotate']:
+                        return np.rot90(img)
+                    # dtype = np.uint16
+                    return img
+                # elif _get_extension(args['input_path']) in ('.tiff', '.tif'): # Best to use tiffile.imread here, lest img_dims is wholly innacurate it will error out later
+                #     img = tifffile.imread(str(args['input_path']))
+                #                          #files=str(args['input_path']),
+                #                           #chunkshape=img_dims,
+                #                           #dtype=np.int16,
+                #                           #out_inplace=False
+                #                           #)
+                #     if args['rotate']:
+                #         img = np.rot90(img)
+                #     # if img.dtype == np.uint16:
+                #     #     img.dtype = np.int16
+                #     return img
+                else:
+                    img = imread(str(input_path))
+                    if args['rotate']:
+                        return np.rot90(img)
+                    # dtype = img.dtype
+                    # if not dont_convert_16bit:
+                    #     dtype = np.uint16
+                    return img
+            except:
+                if i == n -1:
+                    file_name = os.path.join(args['output_root_dir'], 'destripe_log.txt')
+                    if not os.path.exists(file_name):
+                        error_file = open(file_name, 'w')
+                        error_file.write('Error reading the following images.  Pystripe will interpolate their content.')
+                        error_file.close()
+                    error_file = open(file_name, 'a+')
+                    error_file.write('\n{}'.format(str(input_path)))
+                    error_file.close()
+                    args['FAILED_TO_READ'] = True
+                    return
+                else:
+                    time.sleep(0.05)
+                    continue
+
+    single_reads = [_single_read(args) for args in args_batch]
+    single_reads = list(filter(lambda img: img is not None, single_reads))
+    concated = np.concatenate(single_reads)
+    if concated.dtype == np.uint16:
+        concated.dtype = np.int16
+    return torch.from_numpy(concated)
+    # try:
+    #     return torch.from_numpy(concated)
+    # except TypeError:
+        # return torch.from_numpy(concated.astype(np.float32))
+
+def offsign16_to_32(int16_tensor):
+    shift = int(2**15)
+    t = int16_tensor + shift
+    t.to(dtype=torch.float32)
+    return t + shift
 
 def _find_all_images(search_path, input_path, output_path, zstep=None):
     """Find all images with a supported file extension within a directory and all its subdirectories
@@ -698,7 +839,8 @@ def _find_all_images(search_path, input_path, output_path, zstep=None):
     return img_paths
 
 
-def batch_filter(input_path, output_path, workers, chunks, sigma, auto_mode, level=0, wavelet='db3', crossover=10,
+def batch_filter(input_path, output_path, workers, chunks, sigma, auto_mode, 
+                 gpu_acceleration=False, gpu_chunks=int, level=0, wavelet='db3', crossover=10,
                  threshold=-1, compression=1, flat=None, dark=0, zstep=None, rotate=False,
                  lightsheet=False,
                  artifact_length=150,
@@ -722,6 +864,23 @@ def batch_filter(input_path, output_path, workers, chunks, sigma, auto_mode, lev
         number of images for each CPU to process at a time
     sigma : list
         bandwidth of the stripe filter in pixels
+    auto_mode : bool
+        Destriping is reccorded automatically by this script. Set to True by if called by
+        Joe's Destripe GUI.
+    gpu_acceleration : bool
+        Use GPU to perform accelerated destriping. Experimental feature, reimplimentation of the
+        CPU alogorithm using pytorch may yield minor differences in output.
+    gpu_chunks : int
+        number of images for GPU to process at a time. Please note that GPU wavelet destriping uses
+        on the order of 8 times the amount of memory relative to input. Caution is advised to avoid
+        GPU memory limit errors by submitting only a small number of images.
+    ioworkers: int
+        Maximum number of threads to execute
+        :py:attr:`FileSequence.imread` asynchronously.
+        If *None*, default to processors multiplied
+        by 5.
+        Using threads can significantly improve runtime when reading
+        many small files from a network share.
     level : int
         number of wavelet levels to use
     wavelet : str
@@ -750,11 +909,27 @@ def batch_filter(input_path, output_path, workers, chunks, sigma, auto_mode, lev
     if os.path.exists(error_path):
         os.remove(error_path)
 
-    if workers == 0:
-        workers = multiprocessing.cpu_count()
     print('Looking for images in {}...'.format(input_path))
     img_paths = _find_all_images(input_path, input_path, output_path, zstep)
     print('Found {} compatible images'.format(len(img_paths)))
+
+    if gpu_acceleration:
+        if torch.cuda_is_available() is False:
+            print('GPU Device is unavailable. Falling back on CPU methodology.')
+            gpu_acceleration = False
+
+        if lightsheet:
+            print('GPU Acceleration is not available for lightsheet methodology. CPU computation will be used.')
+            gpu_acceleration = False
+
+        if any(_get_extension(fpath) not in ('.tiff', '.tif') for fpath in img_paths):
+            print('GPU Acceleration is only available for TIF/TIFF formats. CPU de-striping will be used instead.')
+            gpu_acceleration = False
+
+    if workers == 0 and gpu_acceleration == False:
+        workers = multiprocessing.cpu_count()
+
+
     # if auto_mode:
         # count_path = os.path.join(input_path, 'image_count.txt')
         # print('count_path: {} count: {}'.format(count_path, len(img_paths)))
@@ -777,7 +952,11 @@ def batch_filter(input_path, output_path, workers, chunks, sigma, auto_mode, lev
             output_file = os.path.join(output_path, os.path.split(file)[1])
             shutil.copyfile(file, output_file)
                 
-    print('Setting up {} workers...'.format(workers))
+    if gpu_acceleration:
+        print('Prepping GPU for accelerated destriping...')
+    else:
+        print('Setting up {} workers...'.format(workers))
+    
     args = []
     for p in img_paths:
         if isinstance(p, tuple):  # DCIMG found
@@ -809,19 +988,21 @@ def batch_filter(input_path, output_path, workers, chunks, sigma, auto_mode, lev
             'percentile': percentile,
             'lightsheet_vs_background': lightsheet_vs_background,
             'dont_convert_16bit' : dont_convert_16bit,
-            'output_format': output_format
+            'output_format': output_format,
+            'FAILED_TO_READ': None
         }
         args.append(arg_dict)
     print('Pystripe batch processing progress:')
-    with multiprocessing.Pool(workers) as pool:
-        if auto_mode:
+    bar_format = '{l_bar}{bar:60}{r_bar}{bar:-10b}' if auto_mode else None
+    if gpu_acceleration:
+        gpu_batch_filter(args, gpu_chunks, bar_format=bar_format)
+    else:
+        with multiprocessing.Pool(workers) as pool:
             list(tqdm.tqdm(
-                pool.imap(_read_filter_save, args, chunksize=chunks), 
-                total=len(args), 
-                ascii=True,
-                bar_format='{l_bar}{bar:60}{r_bar}{bar:-10b}'))
-        else:
-            list(tqdm.tqdm(pool.imap(_read_filter_save, args, chunksize=chunks), total=len(args), ascii=True))
+                    pool.imap(_read_filter_save, args, chunksize=chunks), 
+                    total=len(args), 
+                    ascii=True,
+                    bar_format=bar_format))
     
     print('Done!')
 
@@ -835,6 +1016,157 @@ def batch_filter(input_path, output_path, workers, chunks, sigma, auto_mode, lev
             print('{} images could not be opened and were interpolated.  See destripe log for more details'.format(x))
             fp.close()
 
+def destripe_torch32(imgs_torch, imgs_args):
+    filter_args  = {'sigma': None,
+                    'level': 0,
+                    'wavelet': 'db3',
+                    'crossover': 10,
+                    'threshold': -1,
+                    'flat': None,
+                    'dark':0 }
+    
+    for filter_arg in filter_args:
+        assert(len(set(img_args[filter_arg] for img_args in imgs_args) == 1)), "Batch de-striping can only be done on inputs with identical filter parameters (`sigma`, `level`, `wavelet`, `crossover`, `threshold`, `flat`, `dark`)"
+        filter_args[filter_arg] = imgs_args[0][filter_arg]
+    
+    smoothing = 1
+
+    if filter_args['threshold'] == -1:
+        raise Exception('Please prep threshold prior to destripe_gpu')
+    
+    assert(imgs_torch.shape[-1] % 2 == 0 and imgs_torch.shape[-2] % 2 == 0), "Image dimensions must be a multiple of two. If non-standard image sizes are being used, contact Ben Kaplan ben.kaplan@lifecanvas.com for support"
+
+    sigma1 = filter_args['sigma'][0] # foreground
+    sigma2 = filter_args['sigma'][1] # background
+    if sigma1 > 0:
+        if sigma2 > 0:
+            if sigma1 == sigma2:  #Single band
+                fimgs = filter_subbands_gpu(imgs_torch, sigma1, filter_args)
+            else:
+                background = torch.clip(imgs_torch, None, filter_args['threshold'])
+                foreground = torch.clip(imgs_torch, filter_args['threshold'], None)
+                background_filtered = filter_subbands_gpu(background, sigma2, filter_args)
+                foreground_filtered = filter_subbands_gpu(foreground, sigma1, filter_args)
+                # Smoothed homotopy
+                f = foreground_fraction_torch(imgs_torch,
+                                              filter_args['threshold'],
+                                              filter_args['crossover'],
+                                              smoothing=smoothing)
+                fimgs = foreground_filtered * f + background_filtered * (1 - f)
+        else:
+            foreground = torch.clip(imgs_torch, filter_args['threshold'], None)
+            foreground_filtered = filter_subbands_gpu(foreground, sigma1, filter_args)
+            f = foreground_fraction_torch(imgs_torch,
+                                          filter_args['threshold'],
+                                          filter_args['crossover'],
+                                          smoothing=smoothing)
+            fimgs = foreground_filtered * f + imgs_torch * (1 - f)
+    else:
+        if sigma2 > 0:  # Background filter only
+            background = torch.clip(imgs_torch, None, filter_args['threshold'])
+            background_filtered = filter_subbands_gpu(background, sigma2, filter_args)
+            # Smoothed homotopy
+            f = foreground_fraction_torch(imgs_torch,
+                                          filter_args['threshold'],
+                                          filter_args['crossover'],
+                                          smoothing=smoothing)
+            fimgs = imgs_torch * f + background_filtered * (1 - f)
+        else:
+            fimgs = imgs_torch
+
+    # Subtract the dark offset fiirst
+    if filter_args['dark'] > 0:
+        fimgs = fimgs - filter_args['dark']
+
+    # Divide by the flat
+    if filter_args['flat'] is not None:
+        fimgs = apply_flat_torch(fimgs, filter_args['flat'])
+
+    
+    
+
+
+def filter_subbands_gpu(imgs_torch, use_sigma, filter_args):
+
+    imgs_log = torch.log(1 + imgs_torch)
+
+    if filter_args['level'] == 0:
+        coeffs = wavedec_torch(imgs_log, filter_args['wavelet'])
+    else:
+        coeffs = wavedec_torch(imgs_log, filter_args['wavelet'], filter_args['level'])
+
+    approx = coeffs[0]
+    detail = coeffs[1:]
+
+    width_frac = use_sigma / imgs_torch.shape[-2]
+    coeffs_filt = [approx]
+    for ch, cv, cd in detail:
+        s = ch.shape[-2] * width_frac
+        fch = ftt_torch(ch, shift=False)
+        g = gaussian_filter(shape=fch.shape[-2:], sigma=s)
+        g = torch.from_numpy(np.float32(g)).cuda()
+        fch_filt = fch * g
+        ch_filt = ifft_torch(fch_filt)
+        coeffs_filt.append((ch_filt, cv, cd))
+
+    imgs_log_filtered = waverec_torch(coeffs_filt, filter_args['wavelet'])
+    return torch.exp(imgs_log_filtered)-1
+
+    
+
+
+def _prep_threshold(imgs_batch, args_batch):
+    assert(len(set(args['threshold'] for args in args_batch)) == 1), "Batch loading can only be done on inputs with the same `threshold`. If threshold is set as -1, then a threshold for a batch will be calculated"
+
+    if args_batch[0]['threshold'] == -1:
+        mid_idx = imgs_batch.size[0]/2
+        mid_img = imgs_batch[mid_idx].numpy()
+        if mid_img.dtype == np.int16:
+            mid_img = mid_img.astype(np.uint16, copy=True)
+        try:
+            threshold = threshold_otsu(mid_img)
+        except ValueError:
+            threshold = 1
+
+        for args in args_batch:
+            args['threshold'] = threshold
+
+
+def gpu_batch_filter(args, gpu_chunks, bar_format=None):
+    chunked_args = mit.chunked(args, gpu_chunks)
+
+    with tqdm.tqdm(total=(len(chunked_args)),ascii=True, bar_format=bar_format) as pbar:    
+        last_args_batch = None
+        last_imgs_batch = None
+        for args_batch in chunked_args:
+            # if all(_get_extension(args[input_path] in ['.tiff', '.tif']) for args 
+            imgs_batch = batch_to_torch16(args_batch)
+            args_batch = list(filter(lambda args: args['FAILED_TO_READ'] != True, args_batch))
+            _prep_threshold(imgs_batch, args_batch)
+
+            imgs_batch = imgs_batch.to(device='cuda', non_blocking=False)
+            imgs_batch = destripe_torch32(imgs_batch, args_batch)
+            imgs_batch = imgs_batch.to(device='cpu', non_blocking=True)
+
+            if last_imgs_batch is not None:
+                torch_imwrite(last_imgs_batch, last_args_batch)
+                pbar.update(1)
+
+            last_imgs_batch = imgs_batch
+            last_args_batch = args_batch
+        else:
+            torch_imwrite(last_imgs_batch, last_args_batch)
+            pbar.update(1)
+                    
+def torch_imwrite(imgs_batch, args_batch):
+    images = imgs_batch.numpy()
+    if images.dtype == np.int16:
+        images.dtype = np.uint16
+    
+    for img in images:
+        out_path = str(args_batch.pop(0)['output_path'])
+        tifffile.imwrite(out_path, img, compression=False)
+    
 
 def normalize_flat(flat):
     flat_float = flat.astype(np.float32)
