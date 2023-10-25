@@ -748,27 +748,14 @@ def batch_to_torch16(args_batch, ioworkers=None):
                     img = imread_dcimg(str(input_path), z_idx)
                     if args['rotate']:
                         return np.rot90(img)
-                    # dtype = np.uint16
+
                     return img
-                # elif _get_extension(args['input_path']) in ('.tiff', '.tif'): # Best to use tiffile.imread here, lest img_dims is wholly innacurate it will error out later
-                #     img = tifffile.imread(str(args['input_path']))
-                #                          #files=str(args['input_path']),
-                #                           #chunkshape=img_dims,
-                #                           #dtype=np.int16,
-                #                           #out_inplace=False
-                #                           #)
-                #     if args['rotate']:
-                #         img = np.rot90(img)
-                #     # if img.dtype == np.uint16:
-                #     #     img.dtype = np.int16
-                #     return img
+
                 else:
                     img = imread(str(input_path))
                     if args['rotate']:
                         return np.rot90(img)
-                    # dtype = img.dtype
-                    # if not dont_convert_16bit:
-                    #     dtype = np.uint16
+
                     return img
             except:
                 if i == n -1:
@@ -792,10 +779,7 @@ def batch_to_torch16(args_batch, ioworkers=None):
     if concated.dtype == np.uint16:
         concated.dtype = np.int16
     return torch.from_numpy(concated)
-    # try:
-    #     return torch.from_numpy(concated)
-    # except TypeError:
-        # return torch.from_numpy(concated.astype(np.float32))
+
 
 def offsign16_to_32(int16_tensor):
     shift = int(2**15)
