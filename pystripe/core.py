@@ -197,7 +197,7 @@ def wavedec(img, wavelet, level=None):
     return pywt.wavedec2(img, wavelet, mode='symmetric', level=level, axes=(-2, -1))
 
 def wavedec_torch(imgs_torch, wavelet, level=None):
-    return ptwt.wavedec2(imgs_torch, wavelet, mode='symetric', level=level, axes=(-2, -1))
+    return ptwt.wavedec2(imgs_torch, wavelet, mode='symmetric', level=level)#, axes=(-2, -1))
 
 def waverec(coeffs, wavelet):
     """Reconstruct an image using a multilevel 2D inverse discrete wavelet transform
@@ -218,7 +218,7 @@ def waverec(coeffs, wavelet):
     return pywt.waverec2(coeffs, wavelet, mode='symmetric', axes=(-2, -1))
 
 def waverec_torch(coeffs, wavelet):
-    ptwt.waverec2(coeffs, wavelet, mode='symmetric', axes=(-2, -1))
+    return ptwt.waverec2(coeffs, wavelet)
 
 def fft(data, axis=-1, shift=True):
     """Computes the 1D Fast Fourier Transform of an input array
@@ -400,13 +400,20 @@ def sigmoid_torch(x):
 def foreground_fraction(img, center, crossover, smoothing):
     z = (img-center)/crossover
     f = sigmoid(z)
-    return ndimage.gaussian_filter(f, sigma=smoothing)
+    if smoothing:
+        return ndimage.gaussian_filter(f, sigma=smoothing)
+    else:
+        return f
 
 def foreground_fraction_torch(imgs_torch, center, crossover, smoothing):
     z = (imgs_torch - center)/crossover
     f = sigmoid_torch(z)
-    ks = (8, 8)  # kernal size, set to ~ NDimage defaullt
-    return torchvision.transforms.functional.gaussian_blur(f, ks, smoothing)
+
+    if smoothing:
+        ks = (9, 9)  # kernal size, set to ~ NDimage defaullt
+        return torchvision.transforms.functional.gaussian_blur(f, ks, smoothing)
+    else:
+        return f
 
 def filter_subband(img, sigma, level, wavelet):
     img_log = np.log(1 + img)
@@ -446,7 +453,7 @@ def apply_flat_torch(imgs_torch, flat):
         
 
 
-def filter_streaks(img, sigma, level=0, wavelet='db3', crossover=10, threshold=-1, flat=None, dark=0):
+def filter_streaks(img, sigma, level=0, wavelet='db3', crossover=10, threshold=-1, flat=None, dark=0, extra_smoothing=True):
     """Filter horizontal streaks using wavelet-FFT filter
 
     Parameters
@@ -474,7 +481,6 @@ def filter_streaks(img, sigma, level=0, wavelet='db3', crossover=10, threshold=-
         filtered image
 
     """
-    smoothing = 1
 
     if threshold == -1:
         try:
@@ -504,20 +510,20 @@ def filter_streaks(img, sigma, level=0, wavelet='db3', crossover=10, threshold=-
                 background_filtered = filter_subband(background, sigma[1], level, wavelet)
                 foreground_filtered = filter_subband(foreground, sigma[0], level, wavelet)
                 # Smoothed homotopy
-                f = foreground_fraction(img, threshold, crossover, smoothing=1)
+                f = foreground_fraction(img, threshold, crossover, smoothing=extra_smoothing)
                 fimg = foreground_filtered * f + background_filtered * (1 - f)
         else:  # Foreground filter only
             foreground = np.clip(img, threshold, None)
             foreground_filtered = filter_subband(foreground, sigma[0], level, wavelet)
             # Smoothed homotopy
-            f = foreground_fraction(img, threshold, crossover, smoothing=1)
+            f = foreground_fraction(img, threshold, crossover, smoothing=extra_smoothing)
             fimg = foreground_filtered * f + img * (1 - f)
     else:
         if sigma2 > 0:  # Background filter only
             background = np.clip(img, None, threshold)
             background_filtered = filter_subband(background, sigma[1], level, wavelet)
             # Smoothed homotopy
-            f = foreground_fraction(img, threshold, crossover, smoothing=1)
+            f = foreground_fraction(img, threshold, crossover, smoothing=extra_smoothing)
             fimg = img * f + background_filtered * (1 - f)
         else:
             # sigma1 and sigma2 are both 0, so skip the destriping
@@ -549,6 +555,7 @@ def filter_streaks(img, sigma, level=0, wavelet='db3', crossover=10, threshold=-
 def read_filter_save(output_root_dir, input_path, output_path, sigma, level=0, wavelet='db3',
                      crossover=10, threshold=-1, compression=1,
                      flat=None, dark=0, z_idx=None, rotate=False,
+                     extra_smoothing=True,
                      lightsheet=False,
                      artifact_length=150,
                      background_window_size=200,
@@ -638,7 +645,7 @@ def read_filter_save(output_root_dir, input_path, output_path, sigma, level=0, w
     if rotate:
         img = np.rot90(img)
     if not lightsheet:
-        fimg = filter_streaks(img, sigma, level=level, wavelet=wavelet, crossover=crossover, threshold=threshold, flat=flat, dark=dark)
+        fimg = filter_streaks(img, sigma, level=level, wavelet=wavelet, crossover=crossover, threshold=threshold, flat=flat, dark=dark, extra_smoothing=True)
     else:
         fimg = correct_lightsheet(
             img.reshape(img.shape[0], img.shape[1], 1),
@@ -686,19 +693,19 @@ def _read_filter_save(input_dict):
     read_filter_save(**input_dict)
 
 def num_ioworkers():
-    if os.cpu_count <= 16:
+    if os.cpu_count() <= 16:
         return 8
-    elif os.cpu_count <= 32:
+    elif os.cpu_count() <= 32:
         return 12
-    elif os.cpu_count <= 64:
+    elif os.cpu_count() <= 64:
         return 16
     else:
         return int(0.25 * os.cpu_count)
 
-def batch_to_torch16(args_batch, num_ioworkers, img_dims):
+def batch_to_torch16(args_batch, ioworkers=None):
         
     if (all(_get_extension(args['input_path']) in ('.tiff', '.tif') for args in args_batch) and len(args_batch) > 1):
-        assert(len(set(args['rotation'] for args in args_batch)) == 1), "Batch loading can only be done on inputs with the same `rotation`"
+        assert(len(set(args['rotate'] for args in args_batch)) == 1), "Batch loading can only be done on inputs with the same `rotation`"
         num_attempts = min(3, len(args_batch))
         # dummy_idxs = random.sample(range(len(args_batch)), attempts)
         file_batch = [str(args['input_path']) for args in args_batch]
@@ -719,8 +726,8 @@ def batch_to_torch16(args_batch, num_ioworkers, img_dims):
                                     #dtype=np.int16,
                                     #out_inplace=False,
                                     #ioworkers=ioworkers)
-                
-                if args_batch[0]['rotation']:
+
+                if args_batch[0]['rotate']:
                     batch_ndarry = np.rot90(batch_ndarry)
                 
                 batch_ndarry.dtype = np.int16
@@ -865,7 +872,8 @@ def batch_filter(input_path, output_path, workers, chunks, sigma, auto_mode,
                  percentile=.25,
                  lightsheet_vs_background=2.0,
                  dont_convert_16bit=False,
-                 output_format=None
+                 output_format=None,
+                 extra_smoothing=True
                  ):
     """Applies `streak_filter` to all images in `input_path` and write the results to `output_path`.
 
@@ -920,6 +928,9 @@ def batch_filter(input_path, output_path, workers, chunks, sigma, auto_mode,
         Flag for converting to 16-bit
     output_format: str
         Desired output format [.png, .tiff, .tif]. Default None
+    extra_smoothing : bool or int
+        Whether extra gaussian smoothing is applied to the foreground fraction.
+        calculation. If so, can be an int to specify the magnitude of doing so.
     """
 
     error_path = os.path.join(output_path, 'destripe_log.txt')
@@ -931,7 +942,7 @@ def batch_filter(input_path, output_path, workers, chunks, sigma, auto_mode,
     print('Found {} compatible images'.format(len(img_paths)))
 
     if gpu_acceleration:
-        if torch.cuda_is_available() is False:
+        if torch.cuda.is_available() is False:
             print('GPU Device is unavailable. Falling back on CPU methodology.')
             gpu_acceleration = False
 
@@ -1006,6 +1017,7 @@ def batch_filter(input_path, output_path, workers, chunks, sigma, auto_mode,
             'lightsheet_vs_background': lightsheet_vs_background,
             'dont_convert_16bit' : dont_convert_16bit,
             'output_format': output_format,
+            'extra_smoothing': extra_smoothing,
             'FAILED_TO_READ': None
         }
         args.append(arg_dict)
@@ -1033,7 +1045,7 @@ def batch_filter(input_path, output_path, workers, chunks, sigma, auto_mode,
             print('{} images could not be opened and were interpolated.  See destripe log for more details'.format(x))
             fp.close()
 
-def destripe_torch32(imgs_torch, imgs_args):
+def get_filter_args(imgs_args):
     filter_args  = {'sigma': None,
                     'level': 0,
                     'wavelet': 'db3',
@@ -1043,135 +1055,170 @@ def destripe_torch32(imgs_torch, imgs_args):
                     'dark':0 }
     
     for filter_arg in filter_args:
-        assert(len(set(img_args[filter_arg] for img_args in imgs_args) == 1)), "Batch de-striping can only be done on inputs with identical filter parameters (`sigma`, `level`, `wavelet`, `crossover`, `threshold`, `flat`, `dark`)"
+        assert(len(set(img_args[filter_arg] for img_args in imgs_args)) == 1), "Batch de-striping can only be done on inputs with identical filter parameters (`sigma`, `level`, `wavelet`, `crossover`, `threshold`, `flat`, `dark`)"
         filter_args[filter_arg] = imgs_args[0][filter_arg]
     
     smoothing = 1
 
     if filter_args['threshold'] == -1:
         raise Exception('Please prep threshold prior to destripe_gpu')
+    return filter_args
+
+def destripe_torch32(imgs_torch, imgs_args):
+    filter_args  = {'sigma': None,
+                    'level': 0,
+                    'wavelet': 'db3',
+                    'crossover': 10,
+                    'threshold': -1,
+                    'flat': None,
+                    'dark':0,
+                    'extra_smoothing': 1}
     
-    assert(imgs_torch.shape[-1] % 2 == 0 and imgs_torch.shape[-2] % 2 == 0), "Image dimensions must be a multiple of two. If non-standard image sizes are being used, contact Ben Kaplan ben.kaplan@lifecanvas.com for support"
+    for filter_arg in filter_args:
+        assert(len(set(img_args[filter_arg] for img_args in imgs_args)) == 1), "Batch de-striping can only be done on inputs with identical filter parameters (`sigma`, `level`, `wavelet`, `crossover`, `threshold`, `flat`, `dark`)"
+        filter_args[filter_arg] = imgs_args[0][filter_arg]
 
-    sigma1 = filter_args['sigma'][0] # foreground
-    sigma2 = filter_args['sigma'][1] # background
-    if sigma1 > 0:
-        if sigma2 > 0:
-            if sigma1 == sigma2:  #Single band
-                fimgs = filter_subbands_gpu(imgs_torch, sigma1, filter_args)
-            else:
-                background = torch.clip(imgs_torch, None, filter_args['threshold'])
-                foreground = torch.clip(imgs_torch, filter_args['threshold'], None)
-                background_filtered = filter_subbands_gpu(background, sigma2, filter_args)
-                foreground_filtered = filter_subbands_gpu(foreground, sigma1, filter_args)
-                # Smoothed homotopy
-                f = foreground_fraction_torch(imgs_torch,
-                                              filter_args['threshold'],
-                                              filter_args['crossover'],
-                                              smoothing=smoothing)
-                fimgs = foreground_filtered * f + background_filtered * (1 - f)
-        else:
-            foreground = torch.clip(imgs_torch, filter_args['threshold'], None)
-            foreground_filtered = filter_subbands_gpu(foreground, sigma1, filter_args)
-            f = foreground_fraction_torch(imgs_torch,
-                                          filter_args['threshold'],
-                                          filter_args['crossover'],
-                                          smoothing=smoothing)
-            fimgs = foreground_filtered * f + imgs_torch * (1 - f)
-    else:
-        if sigma2 > 0:  # Background filter only
-            background = torch.clip(imgs_torch, None, filter_args['threshold'])
-            background_filtered = filter_subbands_gpu(background, sigma2, filter_args)
-            # Smoothed homotopy
-            f = foreground_fraction_torch(imgs_torch,
-                                          filter_args['threshold'],
-                                          filter_args['crossover'],
-                                          smoothing=smoothing)
-            fimgs = imgs_torch * f + background_filtered * (1 - f)
-        else:
-            fimgs = imgs_torch
+    if filter_args['threshold'] == -1:
+        raise Exception('Please prep threshold prior to destripe_gpu')
+    
+    assert(imgs_torch.shape[-1] % 2 == 0 and imgs_torch.shape[-2] % 2 == 0), "Image dimensions must be even (a multiple of two). If non-standard image sizes are being used, contact Ben Kaplan ben.kaplan@lifecanvas.com for support"
 
-    # Subtract the dark offset fiirst
+    fimgs = filtersmooth_subbands_gpu(imgs_torch, filter_args)
+
     if filter_args['dark'] > 0:
         fimgs = fimgs - filter_args['dark']
 
     # Divide by the flat
     if filter_args['flat'] is not None:
         fimgs = apply_flat_torch(fimgs, filter_args['flat'])
-
     
-    
+    max_uint16 = float(2**16 - 1)
+    fimgs = torch.clip(fimgs, 0, max_uint16)
+    fimgs = torch.round(fimgs)
 
+    return fimgs
 
-def filter_subbands_gpu(imgs_torch, use_sigma, filter_args):
-
-    imgs_log = torch.log(1 + imgs_torch)
-
-    if filter_args['level'] == 0:
-        coeffs = wavedec_torch(imgs_log, filter_args['wavelet'])
-    else:
-        coeffs = wavedec_torch(imgs_log, filter_args['wavelet'], filter_args['level'])
-
-    approx = coeffs[0]
-    detail = coeffs[1:]
-
-    width_frac = use_sigma / imgs_torch.shape[-2]
-    coeffs_filt = [approx]
-    for ch, cv, cd in detail:
-        s = ch.shape[-2] * width_frac
-        fch = ftt_torch(ch, shift=False)
+def smooth_ch(coeffs, width_frac):
+    for i in range(1, len(coeffs)):
+        ch, cv, cd = coeffs[i]
+        s = ch.size(-2) * width_frac
+        fch = torch.fft.rfft(ch, axis=-1)
         g = gaussian_filter(shape=fch.shape[-2:], sigma=s)
         g = torch.from_numpy(np.float32(g)).to(device='cuda')
         fch_filt = fch * g
-        dim_n = ch.shape[-1]
-        ch_filt = ifft_torch(fch_filt, n=dim_n)
-        coeffs_filt.append((ch_filt, cv, cd))
+        dim_n = ch.size(-1)
+        ch_filt = torch.fft.irfft(fch_filt, n=dim_n)
+        coeffs[i] = (ch_filt, cv, cd)
 
-    imgs_log_filtered = waverec_torch(coeffs_filt, filter_args['wavelet'])
-    return torch.exp(imgs_log_filtered)-1
+def filtersmooth_subbands_gpu(imgs_torch, filter_args):
+    try:
+        foreground_sigma = filter_args['sigma'][0] # foreground
+        background_sigma = filter_args['sigma'][1] # background
+    except:
+        background_sigma = foreground_sigma = filter_args['sigma'] # single sigma
 
+    do_foreground = foreground_sigma > 0
+    do_background = background_sigma > 0 and foreground_sigma != background_sigma
+
+    if do_foreground is False and do_background is False:
+        return imgs_torch # no de-striping is done
     
+    def filter_ground(ground, sigma, filter_args):
+        ground_log = torch.log(1 + ground)
+        sigma_factor = sigma/imgs_torch.size(-1)
+        use_level = filter_args['level'] if filter_args['level'] != 0 else None
+        ground_coeffs =  ptwt.wavedec2(ground_log, filter_args['wavelet'], level=use_level)
+        smooth_ch(ground_coeffs, sigma_factor)
+        ground_rec = ptwt.waverec2(ground_coeffs, filter_args['wavelet'])
+        ground_filtered = torch.exp(ground_rec) - 1
+        return ground_filtered
+
+    if do_foreground:
+        foreground = (torch.clip(imgs_torch, filter_args['threshold'], None)
+                      if foreground_sigma != background_sigma else imgs_torch)
+        foreground_filtered = filter_ground(foreground, foreground_sigma, filter_args)
+    else:
+        foreground_filtered = imgs_torch
+
+    if do_background:
+        background = torch.clip(imgs_torch, None, filter_args['threshold'])
+        background_filtered = filter_ground(background, background_sigma, filter_args)
+    else:
+        background_filtered = imgs_torch
+
+
+    if foreground_sigma != background_sigma:
+        f  = foreground_fraction_torch(imgs_torch,
+                                       center=filter_args['threshold'],
+                                       crossover=filter_args['crossover'],
+                                       smoothing=filter_args['extra_smoothing'])
+
+        return foreground_filtered * f + background_filtered * (1 - f)
+
+    else:
+        return foreground_filtered
 
 
 def _prep_threshold(imgs_batch, args_batch):
     assert(len(set(args['threshold'] for args in args_batch)) == 1), "Batch loading can only be done on inputs with the same `threshold`. If threshold is set as -1, then a threshold for a batch will be calculated"
 
     if args_batch[0]['threshold'] == -1:
-        mid_idx = imgs_batch.size[0]/2
+        mid_idx = int(imgs_batch.size(0)/2)
         mid_img = imgs_batch[mid_idx].numpy()
         if mid_img.dtype == np.int16:
             mid_img = mid_img.astype(np.uint16, copy=True)
-        try:
             threshold = threshold_otsu(mid_img)
-        except ValueError:
-            threshold = 1
 
         for args in args_batch:
             args['threshold'] = threshold
 
 
 def gpu_batch_filter(args, gpu_chunks, bar_format=None):
-    chunked_args = mit.chunked(args, gpu_chunks)
+    chunked_args = list(mit.chunked_even(args, gpu_chunks))
 
     with tqdm.tqdm(total=(len(chunked_args)),ascii=True, bar_format=bar_format) as pbar:    
         last_args_batch = None
         last_imgs_batch = None
         for args_batch in chunked_args:
-            # if all(_get_extension(args[input_path] in ['.tiff', '.tif']) for args 
+            # toc1 = time.time()
             imgs_batch = batch_to_torch16(args_batch)
+            # tic1 = time.time()
+            # print(f"Load time{tic1-toc1: .4}")
+
+            # toc2 = time.time()
             args_batch = list(filter(lambda args: args['FAILED_TO_READ'] != True, args_batch))
             _prep_threshold(imgs_batch, args_batch)
+            # tic2 = time.time()
+            # print(f"inter1 time{tic2-toc2: .4}")
 
+            # toc3 = time.time()
             imgs_batch = imgs_batch.to(device='cuda', non_blocking=False)
-            imgs_batch = destripe_torch32(imgs_batch, args_batch)
-            imgs_batch = imgs_batch.to(device='cpu', non_blocking=True)
+            # tic3 = time.time()
+            # print(f"To Cuda time{tic3-toc3: .4}")
+
+            toc4 = time.time()
+            imgs_batch32 = destripe_torch32(imgs_batch, args_batch)
+            # tic4 = time.time()
+            # print(f"Destriping time{tic4-toc4: .4}")
+
+            # toc5 = time.time()
+            imgs_batch = imgs_batch32.to(device='cpu', dtype=torch.int16, non_blocking=True)
+            #imgs_batch = imgs_batch32.to(device='cpu', dtype=torch.int16, non_blocking=True)
+            # tic5 = time.time()
+            # print(f"Load time{toc5-tic5: .4}")
 
             if last_imgs_batch is not None:
                 torch_imwrite(last_imgs_batch, last_args_batch)
                 pbar.update(1)
+            
+            # tic5 = time.time()
+            # print(f"Async time{tic5-toc5: .4}")
 
             last_imgs_batch = imgs_batch
             last_args_batch = args_batch
+
+            # print(f"Batch time{tic5-toc1: .4}\n\n")
+
         else:
             torch_imwrite(last_imgs_batch, last_args_batch)
             pbar.update(1)
